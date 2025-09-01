@@ -1,0 +1,162 @@
+name: Amazon Clone wih Github Actions
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: amazon-clone
+
+jobs:
+  SonarQube-Scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "16"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup SonarQube
+        uses: warchant/setup-sonar-scanner@v7
+
+      - name: SonarCloud Scan
+        run: |
+          sonar-scanner \
+          -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+          -Dsonar.login=${{ secrets.SONAR_TOKEN }} \
+          -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }} \
+          -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }} \
+          -Dsonar.branch.name=master \
+          -Dsonar.sources=src \
+          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+          -Dsonar.javascript.file.suffixes=.js,.jsx \
+          -Dsonar.exclusions=**/node_modules/**,**/*.test.js,**/*.test.jsx,**/coverage/**,**/build/**,**/public/** \
+          -Dsonar.test.inclusions=**/*.test.js,**/*.test.jsx,**/*.spec.js,**/*.spec.jsx \
+          -Dsonar.coverage.exclusions=**/*.test.js,**/*.test.jsx,**/*.spec.js,**/*.spec.jsx,**/index.js,**/reportWebVitals.js \
+          -Dsonar.sourceEncoding=UTF-8   
+    
+  build-docker-image:
+    needs: SonarQube-Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get version from VERSION file
+        id: get-version
+        run: |
+          if [ -f VERSION ]; then
+            VERSION=$(cat VERSION)
+          else
+            echo "VERSION file not found. Exiting..."
+            exit 1
+          fi
+          echo "Current version: $VERSION"
+          echo version=$VERSION >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} .
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }}
+          format: "table"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 0 # don't fail if vulnerabilities are found
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} .
+
+      - name: Tag and Push Docker image
+        run: |
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }}
+
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  update-kustomize:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Get version from VERSION file
+        id: get-version
+        run: |
+          if [ -f VERSION ]; then
+            VERSION=$(cat VERSION)
+          else
+            echo "VERSION file not found. Exiting..."
+            exit 1
+          fi
+          echo "Current version: $VERSION"
+          echo version=$VERSION >> $GITHUB_OUTPUT
+
+      - name: Clone amazon-clone-infra
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git clone git@github.com:Ndzenyuy/Amazon-Clone-infra.git
+          cd Amazon-Clone-infra
+
+
+          NEW_TAG=${{ steps.get-version.outputs.version }} 
+          sed -i "s/newTag: .*/newTag: $NEW_TAG/" Kubernetes/kustomization.yaml
+
+          git add Kubernetes/kustomization.yaml
+          git commit -m "Update image tag to $NEW_TAG from Repo A CI"
+          git push origin main
