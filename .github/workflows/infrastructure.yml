@@ -14,7 +14,8 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: amazon-clone
+  ECR_REPOSITORY: ecommerce
+  SONAR_HOST_URL: https://sonarcloud.io
 
 jobs:
   SonarQube-Scan:
@@ -45,7 +46,7 @@ jobs:
       - name: SonarCloud Scan
         run: |
           sonar-scanner \
-          -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+          -Dsonar.host.url=${{ env.SONAR_HOST_URL }} \
           -Dsonar.login=${{ secrets.SONAR_TOKEN }} \
           -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }} \
           -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }} \
@@ -57,3 +58,63 @@ jobs:
           -Dsonar.test.inclusions=**/*.test.js,**/*.test.jsx,**/*.spec.js,**/*.spec.jsx \
           -Dsonar.coverage.exclusions=**/*.test.js,**/*.test.jsx,**/*.spec.js,**/*.spec.jsx,**/index.js,**/reportWebVitals.js \
           -Dsonar.sourceEncoding=UTF-8   
+
+  build-docker-image:
+    needs: SonarQube-Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get version from VERSION file
+        id: get-version
+        run: |
+          if [ -f VERSION ]; then
+            VERSION=$(cat VERSION)
+          else
+            echo "VERSION file not found. Exiting..."
+            exit 1
+          fi
+          echo "Current version: $VERSION"
+          echo version=$VERSION >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} .
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }}
+          format: "table"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 0 # don't fail if vulnerabilities are found
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} .
+
+      - name: Tag and Push Docker image
+        run: |
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }}
+
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }} \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.get-version.outputs.version }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
